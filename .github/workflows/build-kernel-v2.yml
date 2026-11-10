@@ -1,0 +1,142 @@
+name: build-zorn-kernel-v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "ACK branch to build"
+        default: "android14-6.1"
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev dwarves ccache cpio \
+            python3 rsync kmod xz-utils zstd lz4 make gcc
+          # clang: prefer 17 (the device kernel was built with clang 17.0.2), fall back to 18
+          for V in 17 18; do
+            if sudo apt-get install -y --no-install-recommends clang-$V lld-$V llvm-$V; then
+              echo "LLVM_VER=$V" >> $GITHUB_ENV
+              for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf llvm-symbolizer llvm-size; do
+                sudo ln -sf /usr/bin/${t}-$V /usr/local/bin/${t} || true
+              done
+              break
+            fi
+          done
+          clang --version | head -2
+          ld.lld --version | head -1
+          pahole --version
+
+      - name: Fetch kernel source
+        run: |
+          BR="${{ inputs.branch }}"
+          [ -z "$BR" ] && BR=android14-6.1
+          echo "BR=$BR" >> $GITHUB_ENV
+          curl -fL --retry 3 -o kernel.tar.gz "https://codeload.github.com/aosp-mirror/kernel_common/tar.gz/refs/heads/$BR"
+          ls -l kernel.tar.gz
+          mkdir -p src
+          tar -xzf kernel.tar.gz -C src --strip-components=1
+          head -5 src/Makefile
+
+      - name: Configure
+        run: |
+          cp config/zorn-6.1.157.config src/.config
+          cd src
+          make ARCH=arm64 LLVM=1 olddefconfig
+          echo "--- key options ---"
+          grep -E '^CONFIG_(DEVTMPFS|DEVTMPFS_MOUNT|CGROUP_PIDS|MACVLAN|IP6_NF_NAT|IP6_NF_TARGET_MASQUERADE|MODULE_FORCE_LOAD|MODVERSIONS|MODULE_SIG|CFI_CLANG|KASAN|LTO_CLANG|TRIM_UNUSED_KSYMS|LOCALVERSION)' .config || true
+          echo "--- dropped by Kconfig (harmless) ---"
+          comm -23 <(grep -E '^CONFIG_' ../config/zorn-6.1.157.config | sort) <(grep -E '^CONFIG_' .config | sort) | head -40
+
+      - name: Relax module version checks
+        run: python3 patches/relax-module-checks.py src
+
+      - name: Build Image
+        run: |
+          cd src
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 Image KCFLAGS="-Wno-error" 2>&1 | tee ../build.log | tail -n 30
+          ls -l arch/arm64/boot/Image
+
+      - name: Verify image and vermagic
+        run: |
+          cd src
+          cat include/generated/utsrelease.h || true
+          python3 - <<'PY'
+          img = open('arch/arm64/boot/Image','rb').read()
+          print('image bytes', len(img))
+          assert img[0x38:0x3c] == b'ARM\x64', 'not a raw arm64 Image'
+          suffix = b' SMP preempt mod_unload modversions aarch64'
+          print('vermagic flag suffix present:', suffix in img)
+          import re
+          m = re.search(rb'6\.1\.[0-9]+[-A-Za-z0-9._]* SMP preempt', img)
+          print('vermagic string:', m.group(0).decode() if m else 'NOT FOUND')
+          for k in (b'devtmpfs', b'macvlan'):
+              print(k.decode(), 'string in image:', k in img)
+          PY
+          grep -E '^CONFIG_(DEVTMPFS|CGROUP_PIDS|MACVLAN|IP6_NF_NAT|IP6_NF_TARGET_MASQUERADE)=' .config
+
+      - name: Preflight - vendor module symbols
+        continue-on-error: true
+        run: |
+          cd src
+          python3 - <<'PY'
+          import os, re
+          exported = {}
+          if os.path.exists('Module.symvers') and os.path.getsize('Module.symvers') > 0:
+              for line in open('Module.symvers'):
+                  p = line.rstrip('\n').split('\t')
+                  if len(p) >= 4:
+                      exported[p[1]] = p[0]
+          print('Module.symvers exported symbols: %d' % len(exported))
+          defined = set()
+          for line in open('System.map'):
+              parts = line.split()
+              if len(parts) >= 3:
+                  defined.add(parts[2])
+          need = [l.strip() for l in open('../abi/vendor-kernel-needed-symbols.txt') if l.strip()]
+          missing_defined = [s for s in need if s not in defined]
+          print('System.map symbols: %d needed: %d not_defined: %d' % (len(defined), len(need), len(missing_defined)))
+          if missing_defined:
+              open('../missing-symbols.txt','w').write('\n'.join(missing_defined))
+              print('NOT DEFINED (first 80):', ', '.join(missing_defined[:80]))
+          if exported:
+              missing_exp = [s for s in need if s not in exported]
+              print('missing from Module.symvers: %d' % len(missing_exp))
+              if missing_exp:
+                  print('first 40:', ', '.join(missing_exp[:40]))
+          vmlinux = 'vmlinux'
+          if os.path.exists(vmlinux):
+              data = open(vmlinux,'rb').read()
+              print('__ksymtab entries:', len(re.findall(rb'__ksymtab_', data)))
+          PY
+          exit 0
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp src/arch/arm64/boot/Image out/Image
+          cp src/Module.symvers out/Module.symvers || true
+          cp src/System.map out/System.map
+          cp src/.config out/config.final
+          cp build.log out/build.log || true
+          cp missing-symbols.txt out/ || true
+          cp src/vmlinux out/vmlinux || true
+          ls -l out
+          sha256sum out/Image | tee out/Image.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zorn-kernel
+          path: out/*
+          retention-days: 14
+          compression-level: 0
