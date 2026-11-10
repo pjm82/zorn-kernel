@@ -1,0 +1,78 @@
+name: build-zorn-mods
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "ACK branch"
+        default: "android14-6.1"
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev dwarves ccache cpio python3 rsync kmod xz-utils zstd lz4 make gcc
+          for V in 17 18; do
+            sudo apt-get install -y clang-$V lld-$V llvm-$V || true
+          done
+          for B in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+            for V in 17 18; do
+              if [ -x /usr/lib/llvm-$V/bin/$B ]; then sudo ln -sf /usr/lib/llvm-$V/bin/$B /usr/local/bin/$B; break; fi
+            done
+          done
+          clang --version | head -2
+
+      - name: Fetch kernel source
+        run: |
+          BR="${{ github.event.inputs.branch }}"
+          [ -z "$BR" ] && BR=android14-6.1
+          mkdir -p src
+          curl -fL -o kernel.tar.gz "https://codeload.github.com/aosp-mirror/kernel_common/tar.gz/refs/heads/$BR"
+          tar -xzf kernel.tar.gz -C src --strip-components=1
+          echo "source ok: $(ls src | head -5)"
+
+      - name: Configure
+        run: |
+          cd src
+          cp ../config/zorn-mods.config .config
+          make ARCH=arm64 LLVM=1 olddefconfig >/dev/null 2>&1 || make ARCH=arm64 LLVM=1 olddefconfig
+          for K in CONFIG_MACVLAN CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_DEVTMPFS CONFIG_CGROUP_PIDS CONFIG_NF_NAT CONFIG_IP6_NF_IPTABLES CONFIG_MODVERSIONS CONFIG_LOCALVERSION; do
+            grep -E "^$K=|^# $K is not set" .config || echo "$K absent"
+          done
+
+      - name: Build image and modules
+        run: |
+          cd src
+          make -j$(nproc) ARCH=arm64 LLVM=1 Image modules KCFLAGS=-Wno-error 2>&1 | tail -40
+          ls -l arch/arm64/boot/Image
+
+      - name: Collect modules
+        if: always()
+        run: |
+          mkdir -p out
+          cd src
+          find . -name '*.ko' -not -path './tools/*' | sort > ../out/ko-list.txt
+          wc -l ../out/ko-list.txt || true
+          while read -r f; do cp "$f" ../out/; done < ../out/ko-list.txt
+          cp Module.symvers ../out/Module.symvers 2>/dev/null || true
+          cp .config ../out/config.final 2>/dev/null || true
+          for f in macvlan.ko nf_nat_ipv6.ko nf_nat_masquerade_ipv6.ko nft_chain_nat_ipv6.ko; do
+            ls -l ../out/$f 2>/dev/null || echo "MISSING $f"
+          done
+          cd ../out && ls -l | head -40 && tar czf ../zorn-mods.tar.gz . && ls -l ../zorn-mods.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zorn-mods
+          path: |
+            zorn-mods.tar.gz
+            out/ko-list.txt
+          compression-level: 0
